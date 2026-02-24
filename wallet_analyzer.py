@@ -1,0 +1,124 @@
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+from chain_providers import EVM_CHAINS, get_provider, get_token_prices
+from models import AddressType, ChainSummary, WalletReport
+from utils import detect_address_type, get_chains_for_address
+
+
+# Map chain IDs -> CoinGecko IDs for price lookups
+CHAIN_TO_COINGECKO: dict[str, str] = {
+    "ethereum": "ethereum",
+    "polygon": "matic-network",
+    "bsc": "binancecoin",
+    "arbitrum": "ethereum",
+    "optimism": "ethereum",
+    "avalanche": "avalanche-2",
+    "base": "ethereum",
+    "fantom": "fantom",
+    "solana": "solana",
+    "bitcoin": "bitcoin",
+    "tron": "tron",
+}
+
+
+class WalletAnalyzer:
+    """Orchestrates multi-chain wallet analysis."""
+
+    async def analyze(
+        self, address: str, chains: Optional[list[str]] = None
+    ) -> WalletReport:
+        address = address.strip()
+        addr_type = detect_address_type(address)
+
+        if addr_type == AddressType.UNKNOWN:
+            raise ValueError(f"Unrecognized address format: {address}")
+
+        target_chains = chains if chains else get_chains_for_address(address)
+        if not target_chains:
+            raise ValueError(
+                f"No supported chains for address type: {addr_type.value}"
+            )
+
+        # ── Fetch token prices ────────────────────────────────────────────
+        coingecko_ids = list(set(
+            CHAIN_TO_COINGECKO[c] for c in target_chains if c in CHAIN_TO_COINGECKO
+        ))
+        prices = await get_token_prices(coingecko_ids)
+
+        # ── Analyze each chain concurrently ───────────────────────────────
+        tasks = []
+        for chain_id in target_chains:
+            provider = get_provider(chain_id)
+            if provider:
+                cg_id = CHAIN_TO_COINGECKO.get(chain_id, "")
+                price = prices.get(cg_id, 0)
+                tasks.append(self._analyze_chain(provider, address, price, chain_id))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # ── Collect successful summaries ──────────────────────────────────
+        chain_summaries: list[ChainSummary] = []
+        for r in results:
+            if isinstance(r, ChainSummary):
+                chain_summaries.append(r)
+
+        # Sort by total transactions descending (top chains first)
+        chain_summaries.sort(key=lambda s: s.total_transactions, reverse=True)
+
+        # ── Aggregate ─────────────────────────────────────────────────────
+        total_txs = sum(s.total_transactions for s in chain_summaries)
+        total_received_usd = sum(s.total_received_usd for s in chain_summaries)
+        total_sent_usd = sum(s.total_sent_usd for s in chain_summaries)
+        total_gas_usd = sum(s.total_gas_spent_usd for s in chain_summaries)
+
+        all_first = [
+            s.first_transaction_date
+            for s in chain_summaries
+            if s.first_transaction_date
+        ]
+        all_last = [
+            s.last_transaction_date
+            for s in chain_summaries
+            if s.last_transaction_date
+        ]
+
+        first_activity = min(all_first) if all_first else None
+        last_activity = max(all_last) if all_last else None
+        wallet_age = (datetime.now() - first_activity).days if first_activity else None
+
+        top_chains = [
+            {
+                "chain": s.chain_name,
+                "transactions": s.total_transactions,
+                "volume_usd": round(s.total_received_usd + s.total_sent_usd, 2),
+            }
+            for s in chain_summaries
+        ]
+
+        return WalletReport(
+            address=address,
+            address_type=addr_type.value,
+            chains_analyzed=target_chains,
+            chains_with_activity=[s.chain for s in chain_summaries],
+            total_transactions=total_txs,
+            total_received_usd=round(total_received_usd, 2),
+            total_sent_usd=round(total_sent_usd, 2),
+            total_gas_spent_usd=round(total_gas_usd, 2),
+            net_flow_usd=round(total_received_usd - total_sent_usd, 2),
+            chain_summaries=chain_summaries,
+            top_chains_by_transactions=top_chains,
+            first_activity=first_activity,
+            last_activity=last_activity,
+            wallet_age_days=wallet_age,
+        )
+
+    async def _analyze_chain(
+        self, provider, address: str, price_usd: float, chain_id: str
+    ) -> Optional[ChainSummary]:
+        try:
+            return await provider.get_chain_summary(address, price_usd)
+        except Exception as e:
+            print(f"  [!] {chain_id} failed: {e}")
+            return None
