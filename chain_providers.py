@@ -1,3 +1,4 @@
+import asyncio
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -66,6 +67,27 @@ EVM_CHAINS = {
 }
 
 
+# ── Alchemy Token API ─────────────────────────────────────────────────────────
+# Single API key, per-chain RPC endpoints.
+
+ALCHEMY_NETWORKS: dict[str, str] = {
+    "ethereum": "eth-mainnet",
+    "polygon": "polygon-mainnet",
+    "arbitrum": "arb-mainnet",
+    "optimism": "opt-mainnet",
+    "base": "base-mainnet",
+    "avalanche": "avax-mainnet",
+}
+
+# Well-known stablecoins → treat as $1.00
+_STABLECOIN_SYMBOLS = {
+    "USDC", "USDT", "DAI", "BUSD", "TUSD", "FRAX", "LUSD", "USDP",
+    "USDC.e", "USDT.e", "USDbC", "USDe",
+}
+# Wrapped native tokens → price = native token price
+_WRAPPED_NATIVE = {"WETH", "WBNB", "WMATIC", "WPOL", "WAVAX", "WFTM"}
+
+
 # ── Base Provider ─────────────────────────────────────────────────────────────
 
 
@@ -83,12 +105,7 @@ class ChainProvider(ABC):
         ...
 
 
-# ── EVM Provider (covers all Etherscan-compatible chains) ────────────────────
-
-
-# Well-known stablecoin symbols for USD price estimation
-_STABLECOIN_SYMBOLS = {"USDC", "USDT", "DAI", "BUSD", "TUSD", "FRAX", "LUSD", "USDP", "USDC.e", "USDT.e"}
-_WRAPPED_NATIVE = {"WETH", "WBNB", "WMATIC", "WPOL", "WAVAX", "WFTM"}
+# ── EVM Provider (Etherscan for txns, Alchemy for token balances) ────────────
 
 
 class EVMChainProvider(ChainProvider):
@@ -99,7 +116,7 @@ class EVMChainProvider(ChainProvider):
         self.symbol = cfg["symbol"]
         self.evm_chain_id = cfg["chain_id"]
 
-        # Use Routescan for Avalanche if SNOWTRACE_API_KEY is set
+        # Etherscan V2 config (transactions)
         snowtrace_key = os.getenv("SNOWTRACE_API_KEY", "")
         if chain_id == "avalanche" and snowtrace_key:
             self.api_base = "https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api"
@@ -110,6 +127,16 @@ class EVMChainProvider(ChainProvider):
             self.api_key = os.getenv("ETHERSCAN_API_KEY", "")
             self.use_routescan = False
 
+        # Alchemy config (token balances + native balance)
+        alchemy_key = os.getenv("ALCHEMY_API_KEY", "")
+        alchemy_net = ALCHEMY_NETWORKS.get(chain_id)
+        if alchemy_key and alchemy_net:
+            self.alchemy_url = f"https://{alchemy_net}.g.alchemy.com/v2/{alchemy_key}"
+        else:
+            self.alchemy_url = ""
+
+    # ── Etherscan API helpers ──────────────────────────────────────────────
+
     async def _api_call(self, client: httpx.AsyncClient, params: dict) -> dict:
         if not self.use_routescan:
             params["chainid"] = self.evm_chain_id
@@ -119,13 +146,14 @@ class EVMChainProvider(ChainProvider):
         resp.raise_for_status()
         data = resp.json()
 
-        # Detect missing/invalid API key
         if data.get("status") == "0" and "API Key" in data.get("result", ""):
             raise PermissionError(
                 f"ETHERSCAN_API_KEY missing or invalid. "
                 f"Get a free key at https://etherscan.io/apis"
             )
         return data
+
+    # ── Transaction History (Etherscan) ────────────────────────────────────
 
     async def get_transactions(self, address: str) -> list[Transaction]:
         transactions: list[Transaction] = []
@@ -203,7 +231,7 @@ class EVMChainProvider(ChainProvider):
                 except (ValueError, OSError):
                     pass
 
-            t = Transaction(
+            transactions.append(Transaction(
                 hash=tx.get("hash", ""),
                 chain=self.chain_id,
                 block_number=int(tx.get("blockNumber", 0)),
@@ -215,17 +243,30 @@ class EVMChainProvider(ChainProvider):
                 is_token_transfer=True,
                 token_symbol=tx.get("tokenSymbol", ""),
                 token_name=tx.get("tokenName", ""),
-            )
-            # Store extra fields for token holdings lookup
-            t._contract_address = tx.get("contractAddress", "")
-            t._decimals = decimals
-            transactions.append(t)
+            ))
         return transactions
+
+    # ── Native Balance (Alchemy preferred, Etherscan fallback) ─────────────
 
     async def _get_native_balance(
         self, address: str, client: httpx.AsyncClient
     ) -> float:
-        """Fetch current native token balance."""
+        # Try Alchemy first (no rate limit issues)
+        if self.alchemy_url:
+            try:
+                resp = await client.post(self.alchemy_url, json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBalance",
+                    "params": [address, "latest"],
+                    "id": 1,
+                }, timeout=15)
+                data = resp.json()
+                hex_bal = data.get("result", "0x0")
+                return wei_to_ether(int(hex_bal, 16))
+            except Exception:
+                pass
+
+        # Etherscan fallback
         try:
             data = await self._api_call(client, {
                 "module": "account",
@@ -238,111 +279,103 @@ class EVMChainProvider(ChainProvider):
             pass
         return 0.0
 
+    # ── Token Holdings (Alchemy — one call gets ALL tokens) ────────────────
+
     async def _get_token_holdings(
-        self, address: str, client: httpx.AsyncClient, token_txs: list[Transaction], price_usd: float
-    ) -> list[TokenBalance]:
-        """Get current token balances from token transfers + on-chain balance queries."""
-        # Collect unique tokens from transfers
-        token_map: dict[str, dict] = {}
-        for tx in token_txs:
-            if tx.token_symbol and hasattr(tx, '_contract_address') and tx._contract_address:
-                key = tx._contract_address.lower()
-                if key not in token_map:
-                    token_map[key] = {
-                        "symbol": tx.token_symbol,
-                        "name": tx.token_name or tx.token_symbol,
-                        "contract": tx._contract_address,
-                        "decimals": getattr(tx, '_decimals', 18),
-                    }
-
-        # If no token data from transfers, try addresstokenbalance endpoint
-        if not token_map:
-            return await self._try_address_token_balance(address, client, price_usd)
-
-        # Query on-chain balance for top 10 tokens
-        holdings: list[TokenBalance] = []
-        for contract_info in list(token_map.values())[:10]:
-            try:
-                data = await self._api_call(client, {
-                    "module": "account",
-                    "action": "tokenbalance",
-                    "contractaddress": contract_info["contract"],
-                    "address": address,
-                })
-                if data.get("status") == "1" and data.get("result"):
-                    raw = int(data["result"])
-                    decimals = contract_info["decimals"]
-                    balance = raw / (10 ** decimals)
-                    if balance > 0:
-                        symbol = contract_info["symbol"]
-                        usd = self._estimate_token_usd(symbol, balance, price_usd)
-                        holdings.append(TokenBalance(
-                            chain=self.chain_id,
-                            symbol=symbol,
-                            name=contract_info["name"],
-                            balance=round(balance, 6),
-                            balance_usd=round(usd, 2),
-                            contract_address=contract_info["contract"],
-                            decimals=decimals,
-                        ))
-            except Exception:
-                continue
-
-        # Also try addresstokenbalance for tokens we might have missed
-        extra = await self._try_address_token_balance(address, client, price_usd)
-        seen = {h.contract_address.lower() for h in holdings if h.contract_address}
-        for t in extra:
-            if t.contract_address and t.contract_address.lower() not in seen:
-                holdings.append(t)
-
-        holdings.sort(key=lambda t: t.balance_usd, reverse=True)
-        return holdings
-
-    async def _try_address_token_balance(
         self, address: str, client: httpx.AsyncClient, price_usd: float
     ) -> list[TokenBalance]:
-        """Try the addresstokenbalance endpoint (may not be available on all APIs)."""
-        holdings: list[TokenBalance] = []
+        if not self.alchemy_url:
+            return []
+
         try:
-            data = await self._api_call(client, {
-                "module": "account",
-                "action": "addresstokenbalance",
-                "address": address,
-                "page": 1,
-                "offset": 20,
-            })
-            if data.get("status") == "1" and isinstance(data.get("result"), list):
-                for item in data["result"]:
-                    decimals = int(item.get("TokenDivisor", item.get("tokenDecimal", 18)))
-                    raw = int(item.get("TokenQuantity", item.get("balance", 0)))
-                    balance = raw / (10 ** decimals) if decimals else raw
-                    if balance > 0:
-                        symbol = item.get("TokenSymbol", item.get("tokenSymbol", ""))
-                        name = item.get("TokenName", item.get("tokenName", symbol))
-                        contract = item.get("TokenAddress", item.get("contractAddress", ""))
-                        usd = self._estimate_token_usd(symbol, balance, price_usd)
-                        holdings.append(TokenBalance(
-                            chain=self.chain_id,
-                            symbol=symbol,
-                            name=name,
-                            balance=round(balance, 6),
-                            balance_usd=round(usd, 2),
-                            contract_address=contract,
-                            decimals=decimals,
-                        ))
-        except Exception:
-            pass
-        return holdings
+            # Step 1: Get ALL token balances in one call
+            resp = await client.post(self.alchemy_url, json={
+                "jsonrpc": "2.0",
+                "method": "alchemy_getTokenBalances",
+                "params": [address, "erc20"],
+                "id": 1,
+            }, timeout=30)
+            data = resp.json()
+
+            all_balances = data.get("result", {}).get("tokenBalances", [])
+
+            # Filter non-zero balances
+            non_zero = []
+            for tb in all_balances:
+                hex_bal = tb.get("tokenBalance", "0x0")
+                if hex_bal and hex_bal != "0x0" and int(hex_bal, 16) > 0:
+                    non_zero.append(tb)
+
+            if not non_zero:
+                return []
+
+            # Step 2: Batch fetch metadata for all non-zero tokens (one HTTP call)
+            batch = [
+                {
+                    "jsonrpc": "2.0",
+                    "method": "alchemy_getTokenMetadata",
+                    "params": [tb["contractAddress"]],
+                    "id": i,
+                }
+                for i, tb in enumerate(non_zero[:30])
+            ]
+
+            meta_resp = await client.post(self.alchemy_url, json=batch, timeout=30)
+            meta_results = meta_resp.json()
+
+            # Handle both list (batch) and single dict (error) responses
+            if not isinstance(meta_results, list):
+                meta_results = [meta_results]
+
+            # Step 3: Build holdings
+            holdings: list[TokenBalance] = []
+            for i, tb in enumerate(non_zero[:30]):
+                meta = {}
+                if i < len(meta_results):
+                    meta = meta_results[i].get("result", {}) or {}
+
+                decimals = meta.get("decimals") or 18
+                symbol = meta.get("symbol") or ""
+                name = meta.get("name") or symbol
+
+                # Skip tokens with no symbol (likely spam/scam)
+                if not symbol:
+                    continue
+
+                raw = int(tb["tokenBalance"], 16)
+                balance = raw / (10 ** decimals) if decimals else float(raw)
+
+                if balance > 0:
+                    usd = self._estimate_token_usd(symbol, balance, price_usd)
+                    holdings.append(TokenBalance(
+                        chain=self.chain_id,
+                        symbol=symbol,
+                        name=name,
+                        balance=round(balance, 6),
+                        balance_usd=round(usd, 2),
+                        contract_address=tb["contractAddress"],
+                        decimals=decimals,
+                    ))
+
+            # Sort by USD value descending (known-value tokens first)
+            holdings.sort(key=lambda t: t.balance_usd, reverse=True)
+            return holdings
+
+        except Exception as e:
+            print(f"  [!] Alchemy token balances failed for {self.chain_id}: {e}")
+            return []
 
     @staticmethod
     def _estimate_token_usd(symbol: str, balance: float, native_price: float) -> float:
-        """Estimate USD value: stablecoins=$1, wrapped native=native price, else 0."""
-        upper = symbol.upper().replace(".E", ".e")
+        upper = symbol.upper()
+        # Check stablecoins (including bridged variants like USDC.e)
         if upper in _STABLECOIN_SYMBOLS or upper.replace(".E", ".e") in _STABLECOIN_SYMBOLS:
             return balance * 1.0
         if upper in _WRAPPED_NATIVE:
             return balance * native_price
         return 0.0
+
+    # ── Chain Summary (combines Etherscan txns + Alchemy balances) ─────────
 
     async def get_chain_summary(
         self, address: str, price_usd: float
@@ -353,7 +386,7 @@ class EVMChainProvider(ChainProvider):
                 token_txs = await self._get_token_transfers(address, client)
                 native_balance = await self._get_native_balance(address, client)
                 token_holdings = await self._get_token_holdings(
-                    address, client, token_txs, price_usd
+                    address, client, price_usd
                 )
             except Exception:
                 return None
@@ -454,7 +487,6 @@ class SolanaProvider(ChainProvider):
             try:
                 txs = await self.get_transactions(address)
 
-                # Also grab current balance
                 bal_result = await self._rpc(client, "getBalance", [address])
                 balance_sol = lamports_to_sol(
                     bal_result.get("result", {}).get("value", 0)
@@ -513,13 +545,11 @@ class BitcoinProvider(ChainProvider):
             data = resp.json()
 
             for tx in data.get("txs", []):
-                # Value received by this address
                 value_in = sum(
                     out.get("value", 0)
                     for out in tx.get("out", [])
                     if out.get("addr") == address
                 )
-                # Value sent from this address
                 value_out = sum(
                     inp.get("prev_out", {}).get("value", 0)
                     for inp in tx.get("inputs", [])
@@ -723,7 +753,6 @@ async def get_token_prices(coingecko_ids: list[str]) -> dict[str, float]:
         return {}
 
     async with httpx.AsyncClient() as client:
-        # Try CoinGecko with retry
         for attempt in range(2):
             try:
                 resp = await client.get(
@@ -736,16 +765,13 @@ async def get_token_prices(coingecko_ids: list[str]) -> dict[str, float]:
                     prices = {k: v.get("usd", 0) for k, v in data.items()}
                     if any(v > 0 for v in prices.values()):
                         return prices
-                # Rate limited (429) — wait and retry
                 if resp.status_code == 429 and attempt == 0:
-                    import asyncio
                     await asyncio.sleep(2)
                     continue
             except Exception:
                 pass
             break
 
-    # Fallback to approximate prices
     print("  [!] CoinGecko unavailable — using fallback prices")
     return {cid: _FALLBACK_PRICES.get(cid, 0) for cid in coingecko_ids}
 
