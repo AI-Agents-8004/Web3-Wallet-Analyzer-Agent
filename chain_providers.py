@@ -5,7 +5,7 @@ from typing import Optional
 
 import httpx
 
-from models import ChainSummary, Transaction
+from models import ChainSummary, TokenBalance, Transaction
 from utils import wei_to_ether, lamports_to_sol, satoshi_to_btc
 
 
@@ -86,6 +86,11 @@ class ChainProvider(ABC):
 # ── EVM Provider (covers all Etherscan-compatible chains) ────────────────────
 
 
+# Well-known stablecoin symbols for USD price estimation
+_STABLECOIN_SYMBOLS = {"USDC", "USDT", "DAI", "BUSD", "TUSD", "FRAX", "LUSD", "USDP", "USDC.e", "USDT.e"}
+_WRAPPED_NATIVE = {"WETH", "WBNB", "WMATIC", "WPOL", "WAVAX", "WFTM"}
+
+
 class EVMChainProvider(ChainProvider):
     def __init__(self, chain_id: str):
         cfg = EVM_CHAINS[chain_id]
@@ -93,13 +98,24 @@ class EVMChainProvider(ChainProvider):
         self.name = cfg["name"]
         self.symbol = cfg["symbol"]
         self.evm_chain_id = cfg["chain_id"]
-        self.api_key = os.getenv("ETHERSCAN_API_KEY", "")
+
+        # Use Routescan for Avalanche if SNOWTRACE_API_KEY is set
+        snowtrace_key = os.getenv("SNOWTRACE_API_KEY", "")
+        if chain_id == "avalanche" and snowtrace_key:
+            self.api_base = "https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api"
+            self.api_key = snowtrace_key
+            self.use_routescan = True
+        else:
+            self.api_base = ETHERSCAN_V2_BASE
+            self.api_key = os.getenv("ETHERSCAN_API_KEY", "")
+            self.use_routescan = False
 
     async def _api_call(self, client: httpx.AsyncClient, params: dict) -> dict:
-        params["chainid"] = self.evm_chain_id
+        if not self.use_routescan:
+            params["chainid"] = self.evm_chain_id
         if self.api_key:
             params["apikey"] = self.api_key
-        resp = await client.get(ETHERSCAN_V2_BASE, params=params, timeout=30)
+        resp = await client.get(self.api_base, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
@@ -187,7 +203,7 @@ class EVMChainProvider(ChainProvider):
                 except (ValueError, OSError):
                     pass
 
-            transactions.append(Transaction(
+            t = Transaction(
                 hash=tx.get("hash", ""),
                 chain=self.chain_id,
                 block_number=int(tx.get("blockNumber", 0)),
@@ -199,8 +215,134 @@ class EVMChainProvider(ChainProvider):
                 is_token_transfer=True,
                 token_symbol=tx.get("tokenSymbol", ""),
                 token_name=tx.get("tokenName", ""),
-            ))
+            )
+            # Store extra fields for token holdings lookup
+            t._contract_address = tx.get("contractAddress", "")
+            t._decimals = decimals
+            transactions.append(t)
         return transactions
+
+    async def _get_native_balance(
+        self, address: str, client: httpx.AsyncClient
+    ) -> float:
+        """Fetch current native token balance."""
+        try:
+            data = await self._api_call(client, {
+                "module": "account",
+                "action": "balance",
+                "address": address,
+            })
+            if data.get("status") == "1" and data.get("result"):
+                return wei_to_ether(int(data["result"]))
+        except Exception:
+            pass
+        return 0.0
+
+    async def _get_token_holdings(
+        self, address: str, client: httpx.AsyncClient, token_txs: list[Transaction], price_usd: float
+    ) -> list[TokenBalance]:
+        """Get current token balances from token transfers + on-chain balance queries."""
+        # Collect unique tokens from transfers
+        token_map: dict[str, dict] = {}
+        for tx in token_txs:
+            if tx.token_symbol and hasattr(tx, '_contract_address') and tx._contract_address:
+                key = tx._contract_address.lower()
+                if key not in token_map:
+                    token_map[key] = {
+                        "symbol": tx.token_symbol,
+                        "name": tx.token_name or tx.token_symbol,
+                        "contract": tx._contract_address,
+                        "decimals": getattr(tx, '_decimals', 18),
+                    }
+
+        # If no token data from transfers, try addresstokenbalance endpoint
+        if not token_map:
+            return await self._try_address_token_balance(address, client, price_usd)
+
+        # Query on-chain balance for top 10 tokens
+        holdings: list[TokenBalance] = []
+        for contract_info in list(token_map.values())[:10]:
+            try:
+                data = await self._api_call(client, {
+                    "module": "account",
+                    "action": "tokenbalance",
+                    "contractaddress": contract_info["contract"],
+                    "address": address,
+                })
+                if data.get("status") == "1" and data.get("result"):
+                    raw = int(data["result"])
+                    decimals = contract_info["decimals"]
+                    balance = raw / (10 ** decimals)
+                    if balance > 0:
+                        symbol = contract_info["symbol"]
+                        usd = self._estimate_token_usd(symbol, balance, price_usd)
+                        holdings.append(TokenBalance(
+                            chain=self.chain_id,
+                            symbol=symbol,
+                            name=contract_info["name"],
+                            balance=round(balance, 6),
+                            balance_usd=round(usd, 2),
+                            contract_address=contract_info["contract"],
+                            decimals=decimals,
+                        ))
+            except Exception:
+                continue
+
+        # Also try addresstokenbalance for tokens we might have missed
+        extra = await self._try_address_token_balance(address, client, price_usd)
+        seen = {h.contract_address.lower() for h in holdings if h.contract_address}
+        for t in extra:
+            if t.contract_address and t.contract_address.lower() not in seen:
+                holdings.append(t)
+
+        holdings.sort(key=lambda t: t.balance_usd, reverse=True)
+        return holdings
+
+    async def _try_address_token_balance(
+        self, address: str, client: httpx.AsyncClient, price_usd: float
+    ) -> list[TokenBalance]:
+        """Try the addresstokenbalance endpoint (may not be available on all APIs)."""
+        holdings: list[TokenBalance] = []
+        try:
+            data = await self._api_call(client, {
+                "module": "account",
+                "action": "addresstokenbalance",
+                "address": address,
+                "page": 1,
+                "offset": 20,
+            })
+            if data.get("status") == "1" and isinstance(data.get("result"), list):
+                for item in data["result"]:
+                    decimals = int(item.get("TokenDivisor", item.get("tokenDecimal", 18)))
+                    raw = int(item.get("TokenQuantity", item.get("balance", 0)))
+                    balance = raw / (10 ** decimals) if decimals else raw
+                    if balance > 0:
+                        symbol = item.get("TokenSymbol", item.get("tokenSymbol", ""))
+                        name = item.get("TokenName", item.get("tokenName", symbol))
+                        contract = item.get("TokenAddress", item.get("contractAddress", ""))
+                        usd = self._estimate_token_usd(symbol, balance, price_usd)
+                        holdings.append(TokenBalance(
+                            chain=self.chain_id,
+                            symbol=symbol,
+                            name=name,
+                            balance=round(balance, 6),
+                            balance_usd=round(usd, 2),
+                            contract_address=contract,
+                            decimals=decimals,
+                        ))
+        except Exception:
+            pass
+        return holdings
+
+    @staticmethod
+    def _estimate_token_usd(symbol: str, balance: float, native_price: float) -> float:
+        """Estimate USD value: stablecoins=$1, wrapped native=native price, else 0."""
+        upper = symbol.upper().replace(".E", ".e")
+        if upper in _STABLECOIN_SYMBOLS or upper.replace(".E", ".e") in _STABLECOIN_SYMBOLS:
+            return balance * 1.0
+        if upper in _WRAPPED_NATIVE:
+            return balance * native_price
+        return 0.0
 
     async def get_chain_summary(
         self, address: str, price_usd: float
@@ -209,6 +351,10 @@ class EVMChainProvider(ChainProvider):
             try:
                 normal_txs = await self.get_transactions(address)
                 token_txs = await self._get_token_transfers(address, client)
+                native_balance = await self._get_native_balance(address, client)
+                token_holdings = await self._get_token_holdings(
+                    address, client, token_txs, price_usd
+                )
             except Exception:
                 return None
 
@@ -243,6 +389,9 @@ class EVMChainProvider(ChainProvider):
                 total_sent_usd=round(total_sent * price_usd, 2),
                 total_gas_spent=round(total_gas, 8),
                 total_gas_spent_usd=round(total_gas * price_usd, 2),
+                native_balance=round(native_balance, 8),
+                native_balance_usd=round(native_balance * price_usd, 2),
+                token_holdings=token_holdings,
                 first_transaction_date=min(timestamps) if timestamps else None,
                 last_transaction_date=max(timestamps) if timestamps else None,
                 unique_contracts_interacted=len(unique_contracts),
@@ -331,6 +480,8 @@ class SolanaProvider(ChainProvider):
                 total_sent_usd=0,
                 total_gas_spent=0,
                 total_gas_spent_usd=0,
+                native_balance=round(balance_sol, 6),
+                native_balance_usd=round(balance_sol * price_usd, 2),
                 first_transaction_date=min(timestamps) if timestamps else None,
                 last_transaction_date=max(timestamps) if timestamps else None,
                 unique_contracts_interacted=0,
@@ -419,6 +570,7 @@ class BitcoinProvider(ChainProvider):
 
             total_received = satoshi_to_btc(data.get("total_received", 0))
             total_sent = satoshi_to_btc(data.get("total_sent", 0))
+            final_balance = satoshi_to_btc(data.get("final_balance", 0))
 
             timestamps: list[datetime] = []
             for tx in data.get("txs", []):
@@ -441,6 +593,8 @@ class BitcoinProvider(ChainProvider):
                 total_sent_usd=round(total_sent * price_usd, 2),
                 total_gas_spent=0,
                 total_gas_spent_usd=0,
+                native_balance=round(final_balance, 8),
+                native_balance_usd=round(final_balance * price_usd, 2),
                 first_transaction_date=min(timestamps) if timestamps else None,
                 last_transaction_date=max(timestamps) if timestamps else None,
                 unique_contracts_interacted=0,

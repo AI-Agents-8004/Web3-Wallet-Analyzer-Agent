@@ -76,6 +76,9 @@ class ChainSummary(BaseModel):
     total_sent_usd: float = 0.0
     total_gas_spent: float = 0.0
     total_gas_spent_usd: float = 0.0
+    native_balance: float = 0.0
+    native_balance_usd: float = 0.0
+    token_holdings: list["TokenBalance"] = []
     first_transaction_date: Optional[datetime] = None
     last_transaction_date: Optional[datetime] = None
     unique_contracts_interacted: int = 0
@@ -92,7 +95,9 @@ class WalletReport(BaseModel):
     total_sent_usd: float = 0.0
     total_gas_spent_usd: float = 0.0
     net_flow_usd: float = 0.0
+    total_current_balance_usd: float = 0.0
     chain_summaries: list[ChainSummary] = []
+    all_token_holdings: list[TokenBalance] = []
     top_chains_by_transactions: list[dict] = []
     first_activity: Optional[datetime] = None
     last_activity: Optional[datetime] = None

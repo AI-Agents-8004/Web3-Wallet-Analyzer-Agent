@@ -95,6 +95,20 @@ class WalletAnalyzer:
         total_sent_usd = sum(s.total_sent_usd for s in chain_summaries)
         total_gas_usd = sum(s.total_gas_spent_usd for s in chain_summaries)
 
+        # ── Current balances ──────────────────────────────────────────────
+        total_native_usd = sum(s.native_balance_usd for s in chain_summaries)
+        total_tokens_usd = sum(
+            sum(t.balance_usd for t in s.token_holdings)
+            for s in chain_summaries
+        )
+        total_current_balance_usd = round(total_native_usd + total_tokens_usd, 2)
+
+        # Flatten all token holdings across chains
+        all_token_holdings = []
+        for s in chain_summaries:
+            all_token_holdings.extend(s.token_holdings)
+        all_token_holdings.sort(key=lambda t: t.balance_usd, reverse=True)
+
         all_first = [
             s.first_transaction_date
             for s in chain_summaries
@@ -115,6 +129,9 @@ class WalletAnalyzer:
                 "chain": s.chain_name,
                 "transactions": s.total_transactions,
                 "volume_usd": round(s.total_received_usd + s.total_sent_usd, 2),
+                "current_balance_usd": round(
+                    s.native_balance_usd + sum(t.balance_usd for t in s.token_holdings), 2
+                ),
             }
             for s in chain_summaries
         ]
@@ -129,7 +146,9 @@ class WalletAnalyzer:
             total_sent_usd=round(total_sent_usd, 2),
             total_gas_spent_usd=round(total_gas_usd, 2),
             net_flow_usd=round(total_received_usd - total_sent_usd, 2),
+            total_current_balance_usd=total_current_balance_usd,
             chain_summaries=chain_summaries,
+            all_token_holdings=all_token_holdings,
             top_chains_by_transactions=top_chains,
             first_activity=first_activity,
             last_activity=last_activity,

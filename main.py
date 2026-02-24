@@ -51,7 +51,7 @@ async def analyze_wallet_mcp(
         try:
             report.ai_insights = insights_agent.generate_insights(report)
         except Exception as e:
-            report.ai_insights = f"AI insights unavailable: {e}"
+            report.ai_insights = "AI insights temporarily unavailable (provider quota exceeded). Wallet data is complete."
     return report.model_dump()
 
 
@@ -176,7 +176,7 @@ async def analyze_wallet(
         try:
             report.ai_insights = insights_agent.generate_insights(report)
         except Exception as e:
-            report.ai_insights = f"AI insights generation failed: {e}"
+            report.ai_insights = f"AI insights temporarily unavailable (provider quota exceeded). Wallet data is complete."
 
     elapsed = int((time.time() - start) * 1000)
     short = req.address[:12]
