@@ -48,14 +48,15 @@ class WalletAnalyzer:
         ))
         prices = await get_token_prices(coingecko_ids)
 
-        # ── Analyze each chain concurrently ───────────────────────────────
+        # ── Analyze chains (max 3 concurrent to avoid rate limits) ────────
+        sem = asyncio.Semaphore(3)
         tasks = []
         for chain_id in target_chains:
             provider = get_provider(chain_id)
             if provider:
                 cg_id = CHAIN_TO_COINGECKO.get(chain_id, "")
                 price = prices.get(cg_id, 0)
-                tasks.append(self._analyze_chain(provider, address, price, chain_id))
+                tasks.append(self._analyze_chain_throttled(sem, provider, address, price, chain_id))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -156,11 +157,12 @@ class WalletAnalyzer:
             warnings=warnings,
         )
 
-    async def _analyze_chain(
-        self, provider, address: str, price_usd: float, chain_id: str
+    async def _analyze_chain_throttled(
+        self, sem: asyncio.Semaphore, provider, address: str, price_usd: float, chain_id: str
     ) -> Optional[ChainSummary]:
-        try:
-            return await provider.get_chain_summary(address, price_usd)
-        except Exception as e:
-            print(f"  [!] {chain_id} failed: {e}")
-            return None
+        async with sem:
+            try:
+                return await provider.get_chain_summary(address, price_usd)
+            except Exception as e:
+                print(f"  [!] {chain_id} failed: {e}")
+                return None
