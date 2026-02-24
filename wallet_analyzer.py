@@ -11,7 +11,7 @@ from utils import detect_address_type, get_chains_for_address
 # Map chain IDs -> CoinGecko IDs for price lookups
 CHAIN_TO_COINGECKO: dict[str, str] = {
     "ethereum": "ethereum",
-    "polygon": "matic-network",
+    "polygon": "polygon-ecosystem-token",
     "bsc": "binancecoin",
     "arbitrum": "ethereum",
     "optimism": "ethereum",

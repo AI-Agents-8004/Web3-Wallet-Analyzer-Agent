@@ -25,7 +25,7 @@ EVM_CHAINS = {
         "name": "Polygon",
         "symbol": "POL",
         "chain_id": 137,
-        "coingecko_id": "matic-network",
+        "coingecko_id": "polygon-ecosystem-token",
     },
     "bsc": {
         "name": "BNB Chain",
@@ -550,25 +550,50 @@ class TronProvider(ChainProvider):
 
 # ── Price Fetcher ─────────────────────────────────────────────────────────────
 
+# Fallback prices (updated periodically) — used when CoinGecko is rate-limited
+_FALLBACK_PRICES: dict[str, float] = {
+    "ethereum": 2500.0,
+    "polygon-ecosystem-token": 0.35,
+    "binancecoin": 650.0,
+    "avalanche-2": 25.0,
+    "fantom": 0.50,
+    "solana": 170.0,
+    "bitcoin": 95000.0,
+    "tron": 0.13,
+}
+
 
 async def get_token_prices(coingecko_ids: list[str]) -> dict[str, float]:
-    """Fetch current USD prices from CoinGecko free API."""
+    """Fetch current USD prices from CoinGecko. Falls back to approximate prices on failure."""
     if not coingecko_ids:
         return {}
 
     async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": ",".join(coingecko_ids), "vs_currencies": "usd"},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return {k: v.get("usd", 0) for k, v in data.items()}
-        except Exception:
-            pass
-    return {}
+        # Try CoinGecko with retry
+        for attempt in range(2):
+            try:
+                resp = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": ",".join(coingecko_ids), "vs_currencies": "usd"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    prices = {k: v.get("usd", 0) for k, v in data.items()}
+                    if any(v > 0 for v in prices.values()):
+                        return prices
+                # Rate limited (429) — wait and retry
+                if resp.status_code == 429 and attempt == 0:
+                    import asyncio
+                    await asyncio.sleep(2)
+                    continue
+            except Exception:
+                pass
+            break
+
+    # Fallback to approximate prices
+    print("  [!] CoinGecko unavailable — using fallback prices")
+    return {cid: _FALLBACK_PRICES.get(cid, 0) for cid in coingecko_ids}
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
