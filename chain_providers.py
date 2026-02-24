@@ -309,37 +309,25 @@ class EVMChainProvider(ChainProvider):
             if not non_zero:
                 return []
 
-            # Step 2: Batch fetch metadata for all non-zero tokens (one HTTP call)
-            batch = [
-                {
-                    "jsonrpc": "2.0",
-                    "method": "alchemy_getTokenMetadata",
-                    "params": [tb["contractAddress"]],
-                    "id": i,
-                }
-                for i, tb in enumerate(non_zero[:30])
-            ]
-
-            meta_resp = await client.post(self.alchemy_url, json=batch, timeout=30)
-            meta_results = meta_resp.json()
-
-            # Handle both list (batch) and single dict (error) responses
-            if not isinstance(meta_results, list):
-                meta_results = [meta_results]
-
-            # Step 3: Build holdings
+            # Step 2: Fetch metadata for each non-zero token
             holdings: list[TokenBalance] = []
-            for i, tb in enumerate(non_zero[:30]):
-                meta = {}
-                if i < len(meta_results):
-                    meta = meta_results[i].get("result", {}) or {}
+            for tb in non_zero[:20]:
+                try:
+                    meta_resp = await client.post(self.alchemy_url, json={
+                        "jsonrpc": "2.0",
+                        "method": "alchemy_getTokenMetadata",
+                        "params": [tb["contractAddress"]],
+                        "id": 1,
+                    }, timeout=10)
+                    meta = meta_resp.json().get("result", {}) or {}
+                except Exception:
+                    meta = {}
 
                 decimals = meta.get("decimals") or 18
                 symbol = meta.get("symbol") or ""
                 name = meta.get("name") or symbol
 
-                # Skip tokens with no symbol (likely spam/scam)
-                if not symbol:
+                if not symbol or self._is_spam_token(symbol, name):
                     continue
 
                 raw = int(tb["tokenBalance"], 16)
@@ -366,10 +354,26 @@ class EVMChainProvider(ChainProvider):
             return []
 
     @staticmethod
+    def _is_spam_token(symbol: str, name: str) -> bool:
+        """Filter out spam/scam airdrop tokens."""
+        text = f"{symbol} {name}".lower()
+        spam_keywords = [
+            "http", ".com", ".io", ".net", ".ly", ".us", ".app",
+            "t.me", "claim", "airdrop", "visit", "swap your",
+            "bridge for", "casino", "ads:", "ads ", "voucher",
+        ]
+        if any(kw in text for kw in spam_keywords):
+            return True
+        # Symbols longer than 12 chars are almost always spam
+        if len(symbol) > 12:
+            return True
+        return False
+
+    @staticmethod
     def _estimate_token_usd(symbol: str, balance: float, native_price: float) -> float:
         upper = symbol.upper()
-        # Check stablecoins (including bridged variants like USDC.e)
-        if upper in _STABLECOIN_SYMBOLS or upper.replace(".E", ".e") in _STABLECOIN_SYMBOLS:
+        # Stablecoins (case-insensitive, including bridged variants)
+        if upper in _STABLECOIN_SYMBOLS or upper in {"USDT", "USDC", "USDT.E", "USDC.E", "USDBC"}:
             return balance * 1.0
         if upper in _WRAPPED_NATIVE:
             return balance * native_price
