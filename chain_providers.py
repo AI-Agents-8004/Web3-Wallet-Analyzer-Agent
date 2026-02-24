@@ -101,7 +101,15 @@ class EVMChainProvider(ChainProvider):
             params["apikey"] = self.api_key
         resp = await client.get(ETHERSCAN_V2_BASE, params=params, timeout=30)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+
+        # Detect missing/invalid API key
+        if data.get("status") == "0" and "API Key" in data.get("result", ""):
+            raise PermissionError(
+                f"ETHERSCAN_API_KEY missing or invalid. "
+                f"Get a free key at https://etherscan.io/apis"
+            )
+        return data
 
     async def get_transactions(self, address: str) -> list[Transaction]:
         transactions: list[Transaction] = []

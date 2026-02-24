@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -58,11 +59,32 @@ class WalletAnalyzer:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # ── Collect successful summaries ──────────────────────────────────
+        # ── Collect successful summaries & warnings ───────────────────────
         chain_summaries: list[ChainSummary] = []
+        warnings: list[str] = []
+        api_key_missing = False
+
         for r in results:
             if isinstance(r, ChainSummary):
                 chain_summaries.append(r)
+            elif isinstance(r, PermissionError):
+                api_key_missing = True
+
+        if api_key_missing:
+            warnings.append(
+                "ETHERSCAN_API_KEY is missing or invalid. "
+                "EVM chain data (Ethereum, Polygon, BSC, Arbitrum, Optimism, Avalanche, Base, Fantom) "
+                "could not be fetched. Get a free key at https://etherscan.io/apis"
+            )
+
+        # Check for no results on EVM addresses
+        evm_targets = [c for c in target_chains if c in EVM_CHAINS]
+        if evm_targets and not chain_summaries and not os.getenv("ETHERSCAN_API_KEY"):
+            warnings.append(
+                "No data returned for any EVM chain. "
+                "This is almost certainly because ETHERSCAN_API_KEY is not set. "
+                "Set it in your .env file or Render environment variables."
+            )
 
         # Sort by total transactions descending (top chains first)
         chain_summaries.sort(key=lambda s: s.total_transactions, reverse=True)
@@ -112,6 +134,7 @@ class WalletAnalyzer:
             first_activity=first_activity,
             last_activity=last_activity,
             wallet_age_days=wallet_age,
+            warnings=warnings,
         )
 
     async def _analyze_chain(

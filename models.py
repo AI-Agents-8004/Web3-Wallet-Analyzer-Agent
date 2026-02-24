@@ -98,6 +98,7 @@ class WalletReport(BaseModel):
     last_activity: Optional[datetime] = None
     wallet_age_days: Optional[int] = None
     ai_insights: Optional[str] = None
+    warnings: list[str] = []
 
 
 # ── API Models ────────────────────────────────────────────────────────────────
